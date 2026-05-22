@@ -1,0 +1,101 @@
+name: Statecraft PR review
+description: >
+  Request a Statecraft visual preview of the journeys touched by this PR.
+  On PR open/synchronize, posts the PR's base/head SHAs to a Statecraft
+  workspace (authenticated via a workspace API token with the
+  `pr-review:run` scope), polls for the run to complete, and posts a
+  sticky PR comment listing one preview link per affected journey.
+
+  Trigger requirement: only the `pull_request` event is supported. We do
+  NOT accept `pull_request_target` — that event exposes secrets to fork
+  PRs while defaulting to a base-branch checkout, and is a common
+  security footgun. See the project README for an example workflow.
+
+inputs:
+  statecraft-token:
+    description: >
+      Workspace API token (sck_…) with the `pr-review:run` scope. Mint one in
+      the Statecraft workspace Settings → API tokens UI.
+    required: true
+  statecraft-base-url:
+    description: >
+      Convex site URL for the Statecraft deployment hosting the HTTP routes
+      (e.g. https://acrid-stoat-123.convex.site). Defaults to production.
+    required: false
+    default: https://api.statecraftapp.com
+  statecraft-web-origin:
+    description: >
+      Web origin used to construct preview links posted to the PR comment.
+      Defaults to production.
+    required: false
+    default: https://statecraftapp.com
+  scope:
+    description: >
+      Optional free-text hint passed to the survey agent to narrow which
+      journeys it bothers enumerating. Example: "checkout flow".
+    required: false
+    default: ''
+  design-system:
+    description: >
+      Optional design-system slug. Required only if the target workspace has
+      more than one design system.
+    required: false
+    default: ''
+  poll-timeout-seconds:
+    description: Max seconds to wait for the run to reach a terminal status.
+    required: false
+    default: '1800'
+  poll-interval-seconds:
+    description: Seconds between status polls.
+    required: false
+    default: '5'
+  github-token:
+    description: >
+      GitHub token used to post the sticky PR comment. Defaults to the job's
+      automatic GITHUB_TOKEN; supply a PAT only if you need to comment from a
+      bot account.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  run-id:
+    description: The prReviewRuns id created (or reused) for this PR.
+    value: ${{ steps.run.outputs.run-id }}
+  status:
+    description: Terminal status of the run (done, failed, cancel_requested).
+    value: ${{ steps.run.outputs.status }}
+  preview-links-json:
+    description: JSON array of {projectId, slug, journeyName, url} for each affected journey.
+    value: ${{ steps.run.outputs.preview-links-json }}
+
+runs:
+  using: composite
+  steps:
+    # Check out the PR head so the script can read `statecraft.yaml` to
+    # discover the design-system slug. `pull_request` events expose the
+    # merge ref by default; we want the head commit since that's what the
+    # Statecraft worker will clone too. Sparse checkout would suffice (we
+    # only read one file) but a normal shallow clone is simpler and the
+    # demo repos are small.
+    - name: Check out PR head
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+        fetch-depth: 1
+    - name: Run Statecraft PR review
+      id: run
+      shell: bash
+      env:
+        STATECRAFT_TOKEN: ${{ inputs.statecraft-token }}
+        STATECRAFT_BASE_URL: ${{ inputs.statecraft-base-url }}
+        STATECRAFT_WEB_ORIGIN: ${{ inputs.statecraft-web-origin }}
+        STATECRAFT_SCOPE: ${{ inputs.scope }}
+        STATECRAFT_DESIGN_SYSTEM: ${{ inputs.design-system }}
+        STATECRAFT_POLL_TIMEOUT: ${{ inputs.poll-timeout-seconds }}
+        STATECRAFT_POLL_INTERVAL: ${{ inputs.poll-interval-seconds }}
+        GH_TOKEN: ${{ inputs.github-token }}
+        # The composite action's working dir is the caller's checkout — but
+        # passing the path explicitly makes the script robust to future
+        # callers who might run it from elsewhere.
+        STATECRAFT_REPO_ROOT: ${{ github.workspace }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/run.sh"
