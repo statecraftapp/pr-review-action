@@ -123,17 +123,22 @@ runs:
         INPUT_PACKAGE_MANAGER: ${{ inputs.package-manager }}
       run: bash "$GITHUB_ACTION_PATH/scripts/resolve-toolchain.sh"
 
-    - name: Setup Node
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ steps.tc.outputs.node-version }}
-        cache: ${{ steps.tc.outputs.pkg-manager }}
-
+    # pnpm BEFORE node when the resolved PM is pnpm — `actions/setup-node`
+    # with `cache: pnpm` requires pnpm to already be on PATH to compute the
+    # cache key. v2.0.1 had these swapped and failed in 2s with
+    # `Unable to locate executable file: pnpm`. Same order the customer's
+    # own `publish.yml` uses (proves the pattern in the wild).
     - name: Setup pnpm
       if: steps.tc.outputs.pkg-manager == 'pnpm'
       uses: pnpm/action-setup@v4
       with:
         version: ${{ steps.tc.outputs.pnpm-version }}
+
+    - name: Setup Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ steps.tc.outputs.node-version }}
+        cache: ${{ steps.tc.outputs.pkg-manager }}
 
     - name: Install statecraft CLI
       shell: bash
