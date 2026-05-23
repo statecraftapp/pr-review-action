@@ -100,16 +100,157 @@ if [[ -z "$design_system" ]]; then
   exit 1
 fi
 
-request_body=$(jq -n \
-  --arg repo "$GITHUB_REPOSITORY" \
-  --argjson prNumber "$pr_number" \
-  --arg baseSha "$base_sha" \
-  --arg headSha "$head_sha" \
-  --arg scope "${STATECRAFT_SCOPE:-}" \
-  --arg designSystem "$design_system" \
-  '{repo: $repo, prNumber: $prNumber, baseSha: $baseSha, headSha: $headSha,
-    designSystem: $designSystem}
-   + (if $scope == "" then {} else {scope: $scope} end)')
+# ---------- v2: diff-detect on the runner + optional DS build ----------
+# Mirrors the journey-worker's `detectDsSourceChange` so we can skip the
+# 1-3 min install + publish on the (majority) PRs that don't touch DS
+# source. When the diff DOES touch DS source, we build the ephemeral DS
+# right here on the runner — using the customer's toolchain (their pnpm
+# version, their lockfile, their `.npmrc`) instead of our worker's
+# corepack-bundled pnpm 10. That's the structural fix for the runtime
+# mismatch class of bug.
+
+repo_root="${STATECRAFT_REPO_ROOT:-$PWD}"
+diff_output=$(mktemp)
+needs_build=false
+diff_reason=""
+if node "$GITHUB_ACTION_PATH/scripts/diff-check.js" "$base_sha" "$head_sha" "$repo_root" >"$diff_output" 2>&1; then
+  needs_build=$(grep -E '^needs_build=' "$diff_output" | head -n 1 | sed -E 's/^needs_build=//')
+  diff_reason=$(grep -E '^reason=' "$diff_output" | head -n 1 | sed -E 's/^reason=//')
+else
+  echo "::warning::diff-check exited non-zero; failing safe to build"
+  cat "$diff_output"
+  needs_build=true
+  diff_reason="diff-check errored"
+fi
+rm -f "$diff_output"
+echo "::group::Runner-side diff check"
+echo "needs_build=$needs_build"
+echo "reason=$diff_reason"
+echo "::endgroup::"
+
+ephemeral_ds_id=""
+ephemeral_ds_slug=""
+
+if [[ "$needs_build" == "true" ]]; then
+  echo "::group::Minting ephemeral publish token"
+  mint_body=$(jq -n \
+    --arg repo "$GITHUB_REPOSITORY" \
+    --argjson prNumber "$pr_number" \
+    --arg headSha "$head_sha" \
+    --arg designSystem "$design_system" \
+    '{repo: $repo, prNumber: $prNumber, headSha: $headSha, designSystem: $designSystem}')
+  mint_response=$(mktemp)
+  http_status=$(curl -sS -o "$mint_response" -w '%{http_code}' \
+    -X POST "$base_url/api/pr-reviews/mint-ephemeral-publish-token" \
+    -H "Authorization: Bearer $STATECRAFT_TOKEN" \
+    -H 'Content-Type: application/json' \
+    -d "$mint_body" || true)
+  if [[ "$http_status" != "200" ]]; then
+    echo "::error::Statecraft refused to mint ephemeral publish token (HTTP $http_status):"
+    cat "$mint_response"
+    echo
+    exit 1
+  fi
+  ephemeral_token=$(jq -r '.token' "$mint_response")
+  ephemeral_ds_slug=$(jq -r '.slug' "$mint_response")
+  ephemeral_ds_id=$(jq -r '.designSystemId' "$mint_response")
+  rm -f "$mint_response"
+  echo "Ephemeral DS: $ephemeral_ds_slug ($ephemeral_ds_id)"
+  echo "::endgroup::"
+
+  echo "::group::Installing dependencies (${STATECRAFT_PKG_MANAGER:-pnpm})"
+  pushd "$repo_root" >/dev/null
+  case "${STATECRAFT_PKG_MANAGER:-pnpm}" in
+    pnpm) pnpm install --frozen-lockfile ;;
+    npm)  npm ci ;;
+    yarn) yarn install --immutable ;;
+    *)
+      echo "::error::Unknown package manager: ${STATECRAFT_PKG_MANAGER}"
+      exit 1
+      ;;
+  esac
+  echo "::endgroup::"
+
+  echo "::group::Building + publishing ephemeral design system"
+  status_file=$(mktemp)
+  # `--skip-install` because we just ran the install above with the
+  # customer's lockfile + their PM. `--status-file` lets us read a clean
+  # JSON outcome regardless of the CLI's textual log output.
+  if ! STATECRAFT_TOKEN="$ephemeral_token" statecraft publish \
+        --slug "$ephemeral_ds_slug" \
+        --manifest "$repo_root/statecraft.yaml" \
+        --skip-install \
+        --status-file "$status_file"; then
+    publish_error=$(jq -r '.error.detail // .error.title // ""' "$status_file" 2>/dev/null || echo "")
+    if [[ -z "$publish_error" ]]; then
+      publish_error="statecraft publish exited non-zero (no status-file detail)"
+    fi
+    echo "::error::Design system build failed: $publish_error"
+    # Post the sticky comment so the PR shows the failure inline, then
+    # exit. No prReviewRuns row exists yet (we haven't POSTed /run), so
+    # this is the only place the failure surfaces in the PR thread.
+    MARKER='<!-- statecraft-pr-review -->'
+    comment_body="$MARKER
+**Statecraft preview · design system build failed.**
+
+The runner-side build of your design system failed before the PR-review run could start. The error from \`statecraft publish\`:
+
+\`\`\`
+$publish_error
+\`\`\`
+
+_See the [Statecraft PR review docs](https://statecraftapp.com/docs/pr-review) for the build-failure troubleshooting steps._"
+    api_base="${GITHUB_API_URL:-https://api.github.com}"
+    payload=$(jq -n --arg body "$comment_body" '{body: $body}')
+    curl -sS -X POST \
+      -H "Authorization: Bearer $GH_TOKEN" \
+      -H 'Accept: application/vnd.github+json' \
+      -H 'X-GitHub-Api-Version: 2022-11-28' \
+      "$api_base/repos/$GITHUB_REPOSITORY/issues/$pr_number/comments" \
+      -d "$payload" >/dev/null || true
+    rm -f "$status_file"
+    exit 1
+  fi
+  publish_status=$(jq -r '.status' "$status_file" 2>/dev/null || echo "")
+  rm -f "$status_file"
+  if [[ "$publish_status" != "published" && "$publish_status" != "nochange" ]]; then
+    echo "::error::statecraft publish reported unexpected status: $publish_status"
+    exit 1
+  fi
+  echo "publish status: $publish_status"
+  popd >/dev/null
+  echo "::endgroup::"
+fi
+
+# ---------- POST the run-create with v2 fields ----------
+if [[ -n "$ephemeral_ds_id" ]]; then
+  request_body=$(jq -n \
+    --arg repo "$GITHUB_REPOSITORY" \
+    --argjson prNumber "$pr_number" \
+    --arg baseSha "$base_sha" \
+    --arg headSha "$head_sha" \
+    --arg scope "${STATECRAFT_SCOPE:-}" \
+    --arg designSystem "$design_system" \
+    --arg ephemeralDsId "$ephemeral_ds_id" \
+    --arg ephemeralDsSlug "$ephemeral_ds_slug" \
+    '{repo: $repo, prNumber: $prNumber, baseSha: $baseSha, headSha: $headSha,
+      designSystem: $designSystem,
+      buildMode: "runner",
+      ephemeralDesignSystemId: $ephemeralDsId,
+      ephemeralDesignSystemSlug: $ephemeralDsSlug}
+     + (if $scope == "" then {} else {scope: $scope} end)')
+else
+  request_body=$(jq -n \
+    --arg repo "$GITHUB_REPOSITORY" \
+    --argjson prNumber "$pr_number" \
+    --arg baseSha "$base_sha" \
+    --arg headSha "$head_sha" \
+    --arg scope "${STATECRAFT_SCOPE:-}" \
+    --arg designSystem "$design_system" \
+    '{repo: $repo, prNumber: $prNumber, baseSha: $baseSha, headSha: $headSha,
+      designSystem: $designSystem}
+     + (if $scope == "" then {} else {scope: $scope} end)')
+fi
 
 create_response=$(mktemp)
 http_status=$(curl -sS -o "$create_response" -w '%{http_code}' \

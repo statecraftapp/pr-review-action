@@ -58,20 +58,32 @@ jobs:
       pull-requests: write   # for the sticky comment
       contents: read
     steps:
-      - uses: statecraftapp/pr-review-action@v1
+      - uses: statecraftapp/pr-review-action@v2
         with:
           statecraft-token: ${{ secrets.STATECRAFT_PR_REVIEW_TOKEN }}
           # Optional: narrow what the survey agent considers.
           # scope: "checkout flow"
           # Optional: override slug if your statecraft.yaml doesn't have one.
           # design-system: my-ds-slug
+          # Optional: override toolchain detection if heuristics misfire.
+          # node-version: "20"
+          # package-manager: pnpm
 ```
+
+## What v2 changed
+
+Starting with `@v2`, the action runs your design system's build **on the GitHub Actions runner** — using your repo's own pnpm/Node version, lockfile, and `.npmrc` — instead of in our Fly worker. That means the same toolchain that powers your canonical `publish.yml` also powers PR-review's per-PR ephemeral build, eliminating "works in my CI, breaks in Statecraft's" surprises (pnpm 10 build-script blocking being the most common). Most PRs don't touch design-system source and skip the build entirely; when the build IS needed the runner caches `pnpm install` across runs natively.
+
+`@v1` keeps working unchanged through at least 2026-08 — pinning to `@v1` keeps the server-side Fly build path.
 
 ## Inputs
 
 | Name | Required | Default | Notes |
 |------|----------|---------|-------|
 | `statecraft-token` | yes | — | `sck_…` workspace token with `pr-review:run` scope. |
+| `node-version` | no | (heuristic) | Override the Node.js version installed on the runner. Default reads `.nvmrc`, then `package.json#engines.node`, falls back to `lts/*`. |
+| `package-manager` | no | (heuristic) | Override the package manager (`pnpm` / `npm` / `yarn`). Default reads `package.json#packageManager`, then falls back to lockfile detection. |
+| `statecraft-cli-version` | no | `latest` | Statecraft CLI version installed for the DS-build step. Pin to lock against breaking changes between minor action releases. |
 | `statecraft-base-url` | no | `https://api.statecraftapp.com` | Convex site URL for the deployment hosting the HTTP routes. |
 | `statecraft-web-origin` | no | `https://statecraftapp.com` | Used to build preview links posted to the PR comment. |
 | `scope` | no | `""` | Free-text hint passed to the survey agent to narrow what it enumerates. |
@@ -112,3 +124,12 @@ new commit to the same PR re-queues the same row with a bumped
 cleanly without clobbering the new attempt's state. Per-journey project
 URLs are stable across pushes when the survey agent reuses the previous
 push's slug (see the `previousJourneys` plumbing in `prReviewRuns`).
+
+## Common errors
+
+| Server response | What it means |
+|---|---|
+| `400 Design system with slug "…" not found in this workspace.` | The slug resolved (from input or `statecraft.yaml`) doesn't match a DS in the workspace your token is scoped to. `statecraft design-system ls` shows what exists where. Align the slug, override it via the workflow input, or import the DS into the right workspace. |
+| `401 Missing/invalid Authorization` | The `statecraft-token` secret is empty, malformed, or scoped to a different deployment than the one the action is POSTing to (default: `api.statecraftapp.com` = prod). Mint a fresh token with the `pr-review:run` scope in the target workspace. |
+| `402 Agent credit limit reached` | Account hit its per-period agent-credit ceiling. Upgrade or add an Anthropic API key on the Account page (BYO-key bypasses metering). |
+| `404` from `api.statecraftapp.com` | Means you're not actually reaching Convex — usually a stale fork of this action with a base-URL that isn't wired up. Use the latest `@v1` and the default `statecraft-base-url`. |

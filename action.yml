@@ -37,8 +37,11 @@ inputs:
     default: ''
   design-system:
     description: >
-      Optional design-system slug. Required only if the target workspace has
-      more than one design system.
+      Design-system slug to render against. If omitted, the action reads
+      a top-level `slug:` from your repo's `statecraft.yaml`. Either the
+      input or the yaml must provide one — the action errors if neither
+      is set. The slug must match a design system in the workspace your
+      `statecraft-token` is scoped to.
     required: false
     default: ''
   poll-timeout-seconds:
@@ -56,6 +59,29 @@ inputs:
       bot account.
     required: false
     default: ${{ github.token }}
+  node-version:
+    description: >
+      Override the Node.js version installed on the runner. By default the
+      action reads `.nvmrc`, then `package.json#engines.node`, falling back
+      to `lts/*`. Pass an explicit value here if those heuristics misfire
+      for your repo.
+    required: false
+    default: ''
+  package-manager:
+    description: >
+      Override the package manager (pnpm | npm | yarn). By default the
+      action reads `package.json#packageManager`, then falls back to
+      lockfile detection. Pass an explicit value here if those heuristics
+      misfire (e.g. monorepo with mixed PMs).
+    required: false
+    default: ''
+  statecraft-cli-version:
+    description: >
+      Statecraft CLI version installed on the runner for the DS-build step.
+      Defaults to `latest`. Pin a specific version (e.g. `2.1.3`) to lock
+      against breaking CLI changes between action minor releases.
+    required: false
+    default: 'latest'
 
 outputs:
   run-id:
@@ -71,17 +97,50 @@ outputs:
 runs:
   using: composite
   steps:
-    # Check out the PR head so the script can read `statecraft.yaml` to
-    # discover the design-system slug. `pull_request` events expose the
-    # merge ref by default; we want the head commit since that's what the
-    # Statecraft worker will clone too. Sparse checkout would suffice (we
-    # only read one file) but a normal shallow clone is simpler and the
-    # demo repos are small.
+    # Check out the PR head — both for the slug lookup and (in v2) so the
+    # runner can do `pnpm install` + `statecraft publish` against the
+    # customer's exact PR-head source. We need full history for the
+    # base...head diff, so fetch-depth=0; this is the only step where it
+    # matters.
     - name: Check out PR head
       uses: actions/checkout@v4
       with:
         ref: ${{ github.event.pull_request.head.sha }}
-        fetch-depth: 1
+        fetch-depth: 0
+
+    # Resolve which Node + package manager versions to set up so the
+    # install on the runner matches the customer's own publish CI. We
+    # deliberately mirror their setup (read `.nvmrc`, `packageManager`,
+    # lockfile) rather than imposing ours — the point of v2 is to use the
+    # customer's existing toolchain, not patch around its incompatibility
+    # with ours.
+    - name: Resolve toolchain versions
+      id: tc
+      shell: bash
+      env:
+        STATECRAFT_REPO_ROOT: ${{ github.workspace }}
+        INPUT_NODE_VERSION: ${{ inputs.node-version }}
+        INPUT_PACKAGE_MANAGER: ${{ inputs.package-manager }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/resolve-toolchain.sh"
+
+    - name: Setup Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ steps.tc.outputs.node-version }}
+        cache: ${{ steps.tc.outputs.pkg-manager }}
+
+    - name: Setup pnpm
+      if: steps.tc.outputs.pkg-manager == 'pnpm'
+      uses: pnpm/action-setup@v4
+      with:
+        version: ${{ steps.tc.outputs.pnpm-version }}
+
+    - name: Install statecraft CLI
+      shell: bash
+      env:
+        STATECRAFT_CLI_VERSION: ${{ inputs.statecraft-cli-version }}
+      run: bash "$GITHUB_ACTION_PATH/scripts/install-cli.sh"
+
     - name: Run Statecraft PR review
       id: run
       shell: bash
@@ -98,4 +157,7 @@ runs:
         # passing the path explicitly makes the script robust to future
         # callers who might run it from elsewhere.
         STATECRAFT_REPO_ROOT: ${{ github.workspace }}
+        # Pass the resolved toolchain to run.sh so its install + publish
+        # steps can shell out to the right binary.
+        STATECRAFT_PKG_MANAGER: ${{ steps.tc.outputs.pkg-manager }}
       run: bash "$GITHUB_ACTION_PATH/scripts/run.sh"
