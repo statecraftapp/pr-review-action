@@ -26,9 +26,10 @@ inputs:
   statecraft-web-origin:
     description: >
       Web origin used to construct preview links posted to the PR comment.
-      Defaults to production.
+      Defaults to the production editor host (the apex `statecraftapp.com`
+      serves the marketing site and does not handle workspace/project paths).
     required: false
-    default: https://statecraftapp.com
+    default: https://editor.statecraftapp.com
   scope:
     description: >
       Optional free-text hint passed to the survey agent to narrow which

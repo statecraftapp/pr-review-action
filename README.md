@@ -1,10 +1,17 @@
 # Statecraft PR review action
 
 Generate a visual preview of the user journeys touched by a pull request. On
-PR open / synchronize, this action POSTs the PR's base + head SHAs to a
-Statecraft workspace; a server-side worker clones the repo at HEAD, runs a
-survey agent that proposes affected journeys, spawns one render run per
-journey, and posts a sticky PR comment with preview links.
+PR open / synchronize, this action checks out the PR head, runs a diff-check
+on the runner, and — if the PR touches design-system source — installs your
+repo's dependencies and runs `statecraft publish` against an ephemeral DS
+snapshot using **your own toolchain** (the pnpm/Node/lockfile/.npmrc your
+own `publish.yml` uses). It then POSTs the PR's coordinates + the ephemeral
+DS id to a Statecraft workspace; a server-side worker runs a survey agent
+that proposes affected journeys, spawns one render run per journey, and
+posts a sticky PR comment with preview links.
+
+`@v1` consumers (legacy) get the older flow where the server worker does
+the build itself — `@v1` keeps working through at least 2026-08.
 
 ## Prerequisites
 
@@ -85,7 +92,7 @@ Starting with `@v2`, the action runs your design system's build **on the GitHub 
 | `package-manager` | no | (heuristic) | Override the package manager (`pnpm` / `npm` / `yarn`). Default reads `package.json#packageManager`, then falls back to lockfile detection. |
 | `statecraft-cli-version` | no | `latest` | Statecraft CLI version installed for the DS-build step. Pin to lock against breaking changes between minor action releases. |
 | `statecraft-base-url` | no | `https://api.statecraftapp.com` | Convex site URL for the deployment hosting the HTTP routes. |
-| `statecraft-web-origin` | no | `https://statecraftapp.com` | Used to build preview links posted to the PR comment. |
+| `statecraft-web-origin` | no | `https://editor.statecraftapp.com` | Used to build preview links posted to the PR comment. |
 | `scope` | no | `""` | Free-text hint passed to the survey agent to narrow what it enumerates. |
 | `design-system` | no | (read from `statecraft.yaml`) | DS slug override. |
 | `poll-timeout-seconds` | no | `1800` | Max seconds to wait for the run to reach a terminal status. |
